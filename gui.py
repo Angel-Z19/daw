@@ -225,17 +225,24 @@ class AudioEngine:
 
     def start(self):
         try:
+            import sounddevice as sd
+            
+            # Dejamos la configuración básica de latencia por defecto
+            sd.default.latency = ('low', 'low')
+
+            # Inicializamos el stream directo y nativo
             self.stream = sd.Stream(
                 samplerate=RATE,
-                blocksize=CHUNK,
+                blocksize=CHUNK,      # Recuerda que CHUNK debe estar definido arriba (ej. 256)
                 dtype='float32',
-                channels=(1, 2),
+                channels=(1, 2),      # 1 Entrada (Guitarra Mono), 2 Salidas (Audífonos Estéreo)
                 device=(self.in_idx, self.out_idx),
                 callback=self._callback,
-                latency='low',
+                latency='low'
             )
             self.stream.start()
             return True, None
+            
         except Exception as e:
             return False, str(e)
 
@@ -327,7 +334,7 @@ class AudioEngine:
 
         # 4. Enviar señal limpia a ambos audífonos (Salida estéreo)
         outdata[:, 0] = proc
-        outdata[:, 1] = proc
+
 
 
 # ═══════════════════════════════════════════════════════════════

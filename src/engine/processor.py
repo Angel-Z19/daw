@@ -44,30 +44,46 @@ class AudioEngine:
         self.comp_ratio = 4.0
 
     def start(self):
-            # IDs: 1 (Focusrite), 8 (Realtek)
+        try:
+            import sounddevice as sd
+            
+            # 1. Forzar un refresco profundo del hardware en Windows
             try:
-                # ENTRADA: Mantenemos Float32 porque la Focusrite es pro
-                self.input_stream = self.p.open(
-                    format=pyaudio.paFloat32,
-                    channels=1, 
-                    rate=self.RATE,
-                    input=True,
-                    input_device_index=1,
-                    frames_per_buffer=self.CHUNK
-                )
+                sd._terminate()
+                sd._initialize()
+            except:
+                pass
+                
+            # 2. Buscar explícitamente el índice de la API ASIO
+            asio_idx = None
+            for i, api in enumerate(sd.query_hostapis()):
+                if "ASIO" in api['name'].upper():
+                    asio_idx = i
+                    break
+            
+            # 3. Si se encuentra ASIO, se activa. Si no, avisamos en la consola flotante.
+            if asio_idx is not None:
+                sd.default.hostapi = asio_idx
+                print("--- [MOTOR REAL] ¡ÉXITO! Conectado nativamente a la autopista ASIO ---")
+            else:
+                print("--- [MOTOR REAL] Alerta: Python sigue sin ver ASIO. Usando driver genérico ---")
 
-                # SALIDA: Cambiamos a paInt16 para máxima compatibilidad con Realtek
-                self.output_stream = self.p.open(
-                    format=pyaudio.paInt16, # <--- CAMBIO CLAVE
-                    channels=2,
-                    rate=self.RATE,
-                    output=True,
-                    output_device_index=7,
-                    frames_per_buffer=self.CHUNK
-                )
-                self.run()
-            except Exception as e:
-                print(f"Error hardware: {e}")
+            # 4. Configurar la ultra-baja latencia
+            sd.default.latency = ('low', 'low')
+            self.stream = sd.Stream(
+                samplerate=RATE,
+                blocksize=CHUNK,      # Verifica que CHUNK = 256 en tus constantes globales
+                dtype='float32',
+                channels=(1, 2),      # 1 Entrada (Guitarra Mono), 2 Salidas (Audífonos)
+                device=(self.in_idx, self.out_idx),
+                callback=self._callback,
+                latency='low'
+            )
+            self.stream.start()
+            return True, None
+            
+        except Exception as e:
+            return False, str(e)
 
     def run(self):
         print("* Motor DSP v0.4 en línea. Procesando cadena de efectos...")
