@@ -24,9 +24,44 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.engine.filters import apply_distort, apply_delay
 
+def apply_compressor(samples, threshold_db=-20.0, ratio=4.0):
+    """Atenúa los picos de volumen que superan el umbral (Threshold)."""
+    threshold_linear = 10 ** (threshold_db / 20.0)
+    amplitude = np.abs(samples)
+    mask = amplitude > threshold_linear
+    output = np.copy(samples)
+    if np.any(mask):
+        output[mask] = np.sign(samples[mask]) * (threshold_linear + (amplitude[mask] - threshold_linear) / ratio)
+    return output
+
+def apply_eq(samples, low_gain=1.0, mid_gain=1.0, high_gain=1.0):
+    """Ecualizador básico de tres bandas (filtro tonal por escalado)."""
+    out = np.copy(samples) * mid_gain
+    # Componente de graves (suavizado por promedio móvil)
+    low_component = np.convolve(samples, np.ones(5)/5, mode='same')
+    out += low_component * (low_gain - 1.0)
+    return np.clip(out, -1.0, 1.0)
+
+def apply_reverb(samples, reverb_buf, room_size=0.6, damping=0.4, wet_mix=0.3):
+    """Simula una estela espacial manteniendo los ecos en un buffer persistente."""
+    delay_samples = int(44100 * 0.25 * room_size) # Aumentamos el tamaño máximo del espacio
+    if delay_samples == 0:
+        return samples
+        
+    n = len(samples)
+    # Rotamos el buffer de memoria para hacer espacio a las nuevas muestras
+    reverb_buf[:-n] = reverb_buf[n:]
+    reverb_buf[-n:] = samples
+    
+    # Extraemos el eco del pasado basado en el tamaño de la habitación
+    echo = reverb_buf[-n - delay_samples : -delay_samples] * (1.0 - damping)
+    
+    # Mezclamos la guitarra limpia con la estela acumulada
+    return (1.0 - wet_mix) * samples + wet_mix * echo
+
 # ── Constantes de audio ───────────────────────────────────────
 RATE     = 44100
-CHUNK    = 512
+CHUNK    = 256
 DISP_LEN = RATE // 3   # ~0.33 s de historia en la forma de onda
 
 # ── Paleta de colores (dark DAW) ──────────────────────────────
@@ -159,6 +194,21 @@ class SharedState:
         self.wave_pos       = 0
         self.rms            = 0.0
 
+        # ── NUEVAS VARIABLES PARA V0.4 ─────────────────────────
+        self.reverb_on      = False
+        self.reverb_size    = 0.60
+        self.reverb_damping = 0.45
+        self.reverb_wet     = 0.35
+        
+        self.eq_on          = False
+        self.eq_low         = 1.0
+        self.eq_mid         = 1.0
+        self.eq_high        = 1.0
+        
+        self.comp_on        = False
+        self.comp_thresh    = -20.0
+        self.comp_ratio     = 4.0
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Motor de audio (sounddevice callback)
@@ -170,6 +220,8 @@ class AudioEngine:
         self.out_idx   = out_idx
         self.stream    = None
         self.delay_buf = np.zeros(CHUNK, dtype=np.float32)
+
+        self.reverb_buf = np.zeros(RATE, dtype=np.float32) # Un segundo completo de memoria
 
     def start(self):
         try:
@@ -207,19 +259,43 @@ class AudioEngine:
             lp_on    = s.lowpass_on
             alpha    = s.lowpass_alpha
 
-        # 1. Ganancia maestra
-        proc = samples * gain
+            # Nuevas variables leídas de forma segura desde el hilo de audio:
+            rev_on   = s.reverb_on
+            r_size   = s.reverb_size
+            r_damp   = s.reverb_damping
+            r_wet    = s.reverb_wet
+            eq_on    = s.eq_on
+            eq_l     = s.eq_low
+            eq_m     = s.eq_mid
+            eq_h     = s.eq_high
+            comp_on  = s.comp_on
+            c_thr    = s.comp_thresh
+            c_rat    = s.comp_ratio
 
-        # 2. Distorsión (hard clipping)
+        # 2. Copia inicial de la señal limpia
+        proc = samples.copy()
+
+        # ── CADENA DSP EN CASCADA (AUDIO COMPLETO v0.4) ───────────
+        
+        # A. Compresor (Primero en la cadena para estabilizar la guitarra)
+        if comp_on:
+            proc = apply_compressor(proc, c_thr, c_rat)
+            
+        # B. Ecualizador (Modifica el tono básico)
+        if eq_on:
+            proc = apply_eq(proc, eq_l, eq_m, eq_h)
+
+        # C. Ganancia Maestra + Distorsión original
+        proc = proc * gain
         if dist_on:
             proc = apply_distort(proc, dgain, dthresh)
 
-        # 3. Delay
+        # D. Delay original
         if delay_on:
             proc = apply_delay(proc, self.delay_buf, dfb)
             self.delay_buf = proc.copy()
 
-        # 4. Filtro pasa-bajos (IIR primer orden)
+        # E. Filtro pasa-bajos original
         if lp_on:
             filt = np.empty_like(proc)
             prev = proc[0]
@@ -227,10 +303,16 @@ class AudioEngine:
                 prev    = alpha * proc[i] + (1.0 - alpha) * prev
                 filt[i] = prev
             proc = filt
+            
+        # F. Reverb (Efecto espacial, va al final antes de la salida)
+        if rev_on:
+            proc = apply_reverb(proc, self.reverb_buf, r_size, r_damp, r_wet)
 
-        proc = np.clip(proc, -1.0, 1.0)
+        PRE_AMP = 3.5
+        proc = proc * PRE_AMP * gain
 
-        # Actualizar buffer circular de visualización
+
+        # Actualizar buffer circular de visualización gráfica (Líneas originales)
         n   = len(proc)
         end = s.wave_pos + n
         if end <= DISP_LEN:
@@ -243,7 +325,7 @@ class AudioEngine:
 
         s.rms = float(np.sqrt(np.mean(proc ** 2)))
 
-        # Salida estéreo
+        # 4. Enviar señal limpia a ambos audífonos (Salida estéreo)
         outdata[:, 0] = proc
         outdata[:, 1] = proc
 
@@ -417,7 +499,7 @@ class DAWWindow(QMainWindow):
             lbl.setObjectName(name)
             layout.addWidget(lbl)
 
-        sub = QLabel("Estación de Trabajo de Audio Digital · Prototipo v0.3")
+        sub = QLabel("Estación de Trabajo de Audio Digital · Prototipo v0.4")
         sub.setObjectName("header-sub")
         layout.addWidget(sub)
         layout.addStretch()
@@ -447,7 +529,7 @@ class DAWWindow(QMainWindow):
 
         layout.addWidget(self._effect_section(
             "MASTER", None,
-            [("Ganancia", 0.0, 2.0, 0.30, 'gain', '{:.2f}')],
+            [("Ganancia", 0.0, 6.0, 1.00, 'gain', '{:.2f}')], 
         ))
         layout.addWidget(self._effect_section(
             "DISTORSIÓN", ('distort_on', f"background:#3d1a1a; color:{RED}; border-color:{RED};", "Activar"),
@@ -462,6 +544,28 @@ class DAWWindow(QMainWindow):
             "FILTRO PASA-BAJOS", ('lowpass_on', f"background:#271a3d; color:{PURPLE}; border-color:{PURPLE};", "Activar"),
             [("Alpha", 0.05, 1.0, 0.5, 'lowpass_alpha', '{:.2f}')],
         ))
+
+        # ── NUEVOS PANELES V0.4 ────────────────────────────────
+        layout.addWidget(self._effect_section(
+            "REVERB", ('reverb_on', f"background:#1a3d37; color:#3fb950; border-color:#3fb950;", "Activar"),
+            [("Size",    0.1, 1.0, 0.60, 'reverb_size',    '{:.2f}'),
+             ("Damping", 0.0, 1.0, 0.45, 'reverb_damping', '{:.2f}'),
+             ("Wet Mix", 0.0, 1.0, 0.35, 'reverb_wet',     '{:.2f}')],
+        ))
+
+        layout.addWidget(self._effect_section(
+            "EQUALIZADOR (EQ)", ('eq_on', f"background:#3d361a; color:{YELLOW}; border-color:{YELLOW};", "Activar"),
+            [("Low",  0.1, 2.0, 1.0, 'eq_low',  '{:.2f}'),
+             ("Mid",  0.1, 2.0, 1.0, 'eq_mid',  '{:.2f}'),
+             ("High", 0.1, 2.0, 1.0, 'eq_high', '{:.2f}')],
+        ))
+
+        layout.addWidget(self._effect_section(
+            "COMPRESOR", ('comp_on', f"background:#2a1a3d; color:#d2a8ff; border-color:#d2a8ff;", "Activar"),
+            [("Threshold", -40.0, 0.0, -20.0, 'comp_thresh', '{:.1f} dB'),
+             ("Ratio",       1.0, 8.0,   4.0, 'comp_ratio',  '{:.1f}:1')],
+        ))
+
 
         layout.addStretch()
         return panel
