@@ -1,11 +1,13 @@
 import pyaudio
 import numpy as np
-from src.engine.filters import apply_distort, apply_lowpass
+import os
+from src.engine.filters import apply_distort, apply_lowpass, apply_compressor, apply_delay, apply_eq, apply_reverb
+
 
 class AudioEngine:
     def __init__(self):
         self.RATE = 44100
-        self.CHUNK = 512
+        self.CHUNK = 256
         self.p = pyaudio.PyAudio()
         self.input_stream = None
         self.output_stream = None
@@ -13,78 +15,62 @@ class AudioEngine:
         # --- VARIABLES DE CONTROL (Enlazadas a la GUI) ---
         self.master_gain = 0.30
         
-        # Distorsión
-        self.distort_active = False
-        self.distort_gain = 2.0
-        self.distort_threshold = 0.70
+        self.stream = None
         
-        # Delay
-        self.delay_active = False
-        self.delay_feedback = 0.40
+        # Valores iniciales por defecto para que no se queje el editor
+        self.comp_on = False
+        self.c_thr = -20.0
+        self.c_rat = 4.0
         
-        # Filtro Pasa-Bajos
-        self.filter_active = False
-        self.filter_alpha = 0.50
+        self.eq_on = False
+        self.eq_l = 1.0
+        self.eq_m = 1.0
+        self.eq_h = 1.0
         
-        # NUEVO: Reverb
-        self.reverb_active = False
-        self.reverb_size = 0.60
-        self.reverb_damping = 0.45
-        self.reverb_wet = 0.35
+        self.gain = 1.0
+        self.dist_on = False
+        self.dgain = 2.0
+        self.dthresh = 0.5
         
-        # NUEVO: EQ (Valores lineales derivados de los dB de la interfaz)
-        self.eq_active = False
-        self.eq_low = 1.0   # Corresponde a 0 dB (sin cambio)
-        self.eq_mid = 1.0
-        self.eq_high = 1.0
+        self.delay_on = False
+        self.delay_buf = np.zeros(44100) # Buffer para un segundo de delay
+        self.dfb = 0.5
         
-        # NUEVO: Compresor
-        self.comp_active = False
-        self.comp_threshold = -20.0
-        self.comp_ratio = 4.0
+        self.lp_on = False
+        self.alpha = 0.5
 
     def start(self):
         try:
+            import os
+            # 1. Activamos la variable de entorno obligatoria antes de importar sounddevice
+            os.environ["SD_ENABLE_ASIO"] = "1"
+            
             import sounddevice as sd
-            
-            # 1. Forzar un refresco profundo del hardware en Windows
-            try:
-                sd._terminate()
-                sd._initialize()
-            except:
-                pass
-                
-            # 2. Buscar explícitamente el índice de la API ASIO
-            asio_idx = None
-            for i, api in enumerate(sd.query_hostapis()):
-                if "ASIO" in api['name'].upper():
-                    asio_idx = i
-                    break
-            
-            # 3. Si se encuentra ASIO, se activa. Si no, avisamos en la consola flotante.
-            if asio_idx is not None:
-                sd.default.hostapi = asio_idx
-                print("--- [MOTOR REAL] ¡ÉXITO! Conectado nativamente a la autopista ASIO ---")
-            else:
-                print("--- [MOTOR REAL] Alerta: Python sigue sin ver ASIO. Usando driver genérico ---")
+            import numpy as np
 
-            # 4. Configurar la ultra-baja latencia
-            sd.default.latency = ('low', 'low')
+            # 2. Tu configuración exacta que ya demostró tener CERO delay
+            fs = 44100         
+            blocksize = 128    # Forzamos el buffer ultra bajo de tu prueba exitosa
+            device_idx = 26    # ¡Tu índice mágico que conecta directo a Focusrite ASIO!
+
+            # 3. Encendemos el stream ASIO nativo usando tus funciones internas
             self.stream = sd.Stream(
-                samplerate=RATE,
-                blocksize=CHUNK,      # Verifica que CHUNK = 256 en tus constantes globales
-                dtype='float32',
-                channels=(1, 2),      # 1 Entrada (Guitarra Mono), 2 Salidas (Audífonos)
-                device=(self.in_idx, self.out_idx),
-                callback=self._callback,
-                latency='low'
+                device=device_idx,
+                samplerate=fs,
+                blocksize=blocksize,
+                channels=2,        # Configuración estéreo idéntica a tu test.py
+                callback=self._callback
             )
+            
             self.stream.start()
+            print("-" * 50)
+            print("¡MOTOR PRINCIPAL CONECTADO A FOCUSRITE ASIO (CERO DELAY)!")
+            print("-" * 50)
             return True, None
             
         except Exception as e:
             return False, str(e)
-
+            
     def run(self):
         print("* Motor DSP v0.4 en línea. Procesando cadena de efectos...")
         try:
@@ -128,6 +114,50 @@ class AudioEngine:
             print(f"Error en cadena DSP: {e}")
         finally:
             self.stop()
+
+    def _callback(self, indata, outdata, frames, time, status):
+        if status:
+            print(f"Alerta de Audio: {status}")
+        
+        # 1. Entrada de la guitarra en canal ASIO correcto
+        guitarra = indata[:, 1]
+        proc = guitarra.copy()
+        
+        # =========================================================================
+        # ─── CADENA DSP CON ADVERTENCIAS CORREGIDAS (Añadiendo 'self.') ──────────
+        # =========================================================================
+        
+        # A. Compresor (Usa los estados guardados en la instancia del motor)
+        if self.comp_on:
+            proc = apply_compressor(proc, self.c_thr, self.c_rat)
+            
+        # B. Ecualizador
+        if self.eq_on:
+            proc = apply_eq(proc, self.eq_l, self.eq_m, self.eq_h)
+            
+        # C. Ganancia Maestra + Distorsión
+        proc = proc * self.gain
+        if self.dist_on:
+            proc = apply_distort(proc, self.dgain, self.dthresh)
+            
+        # D. Delay
+        if self.delay_on:
+            proc = apply_delay(proc, self.delay_buf, self.dfb)
+            self.delay_buf = proc.copy()
+            
+        # E. Filtro pasa-bajos
+        if self.lp_on:
+            filt = np.empty_like(proc)
+            prev = proc[0]
+            for i in range(len(proc)):
+                # Cambiamos alpha por self.alpha
+                prev = self.alpha * proc[i] + (1.0 - self.alpha) * prev
+                filt[i] = prev
+            proc = filt
+
+        # Enviar salida estéreo limpia a la Focusrite
+        outdata[:, 0] = proc  
+        outdata[:, 1] = proc
 
     def stop(self):
         if self.input_stream:

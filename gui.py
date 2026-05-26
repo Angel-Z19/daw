@@ -1,827 +1,563 @@
-#!/usr/bin/env python3
 """
-DAW GUI — Estación de Trabajo de Audio Digital
-Interfaz gráfica: PyQt6 + QPainter | Audio: sounddevice
-Funciona en: Windows, Linux y Mac
-Ejecución: python gui.py
+DAW — Estación de Trabajo de Audio Digital
+GUI v2.1 — Ondas y efectos corregidos
 """
 
-import sys
-import os
+import tkinter as tk
 import threading
 import numpy as np
-import sounddevice as sd
+import queue
+import time
+import sys
+import os
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QSlider, QPushButton, QComboBox, QSizePolicy,
-    QMessageBox, QFrame
-)
-from PyQt6.QtCore import Qt, QTimer, QPointF
-from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF
-
-# ── Ruta para encontrar el módulo src ─────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.engine.filters import apply_distort, apply_delay
+try:
+    from src.engine.processor import AudioEngine
+    ENGINE_AVAILABLE = True
+except ImportError:
+    ENGINE_AVAILABLE = False
+    print("[AVISO] No se pudo importar AudioEngine. Modo demo activo.")
 
-def apply_compressor(samples, threshold_db=-20.0, ratio=4.0):
-    """Atenúa los picos de volumen que superan el umbral (Threshold)."""
-    threshold_linear = 10 ** (threshold_db / 20.0)
-    amplitude = np.abs(samples)
-    mask = amplitude > threshold_linear
-    output = np.copy(samples)
-    if np.any(mask):
-        output[mask] = np.sign(samples[mask]) * (threshold_linear + (amplitude[mask] - threshold_linear) / ratio)
-    return output
+# ═══════════════════════════════════════════════════════════════════════════════
+# PALETA DE COLORES
+# ═══════════════════════════════════════════════════════════════════════════════
+C = {
+    "bg":            "#0d0f14",
+    "panel":         "#13161e",
+    "panel2":        "#1a1e28",
+    "border":        "#252a38",
+    "border_light":  "#2e3447",
+    "accent":        "#00e5a0",
+    "accent2":       "#00b8ff",
+    "danger":        "#ff4466",
+    "warn":          "#ffb020",
+    "text":          "#e8ecf4",
+    "text_dim":      "#6b7590",
+    "text_mid":      "#9aa3bc",
+    "slider_trough": "#1e2230",
+    "btn_on":        "#00e5a0",
+    "btn_on_fg":     "#0d0f14",
+    "btn_off":       "#1e2230",
+    "btn_off_fg":    "#6b7590",
+    "vu_green":      "#00e5a0",
+    "vu_yellow":     "#ffb020",
+    "vu_red":        "#ff4466",
+    "wave_in":       "#00e5a0",
+    "wave_out":      "#00b8ff",
+}
 
-def apply_eq(samples, low_gain=1.0, mid_gain=1.0, high_gain=1.0):
-    """Ecualizador básico de tres bandas (filtro tonal por escalado)."""
-    out = np.copy(samples) * mid_gain
-    # Componente de graves (suavizado por promedio móvil)
-    low_component = np.convolve(samples, np.ones(5)/5, mode='same')
-    out += low_component * (low_gain - 1.0)
-    return np.clip(out, -1.0, 1.0)
-
-def apply_reverb(samples, reverb_buf, room_size=0.6, damping=0.4, wet_mix=0.3):
-    """Simula una estela espacial manteniendo los ecos en un buffer persistente."""
-    delay_samples = int(44100 * 0.25 * room_size) # Aumentamos el tamaño máximo del espacio
-    if delay_samples == 0:
-        return samples
-        
-    n = len(samples)
-    # Rotamos el buffer de memoria para hacer espacio a las nuevas muestras
-    reverb_buf[:-n] = reverb_buf[n:]
-    reverb_buf[-n:] = samples
-    
-    # Extraemos el eco del pasado basado en el tamaño de la habitación
-    echo = reverb_buf[-n - delay_samples : -delay_samples] * (1.0 - damping)
-    
-    # Mezclamos la guitarra limpia con la estela acumulada
-    return (1.0 - wet_mix) * samples + wet_mix * echo
-
-# ── Constantes de audio ───────────────────────────────────────
-RATE     = 44100
-CHUNK    = 256
-DISP_LEN = RATE // 3   # ~0.33 s de historia en la forma de onda
-
-# ── Paleta de colores (dark DAW) ──────────────────────────────
-BG_DARK  = '#0d1117'
-BG_PANEL = '#161b22'
-BG_INPUT = '#21262d'
-BORDER   = '#30363d'
-TEXT_DIM = '#8b949e'
-TEXT_ON  = '#e6edf3'
-ACCENT   = '#58a6ff'
-GREEN    = '#3fb950'
-RED      = '#f78166'
-YELLOW   = '#d29922'
-PURPLE   = '#d2a8ff'
-
-QSS = f"""
-QMainWindow, QWidget {{
-    background-color: {BG_DARK};
-    color: {TEXT_ON};
-}}
-QLabel#section-lbl {{
-    color: {TEXT_DIM};
-    font-size: 9px;
-    font-weight: 800;
-    letter-spacing: 2px;
-}}
-QLabel#param-lbl {{
-    color: {TEXT_ON};
-    font-size: 10px;
-}}
-QLabel#value-lbl {{
-    color: {ACCENT};
-    font-size: 10px;
-    font-family: monospace;
-}}
-QLabel#dim-lbl {{
-    color: {TEXT_DIM};
-    font-size: 10px;
-}}
-QLabel#header-title {{
-    color: {ACCENT};
-    font-size: 18px;
-    font-weight: bold;
-}}
-QLabel#header-sub {{
-    color: {TEXT_DIM};
-    font-size: 10px;
-}}
-QSlider::groove:horizontal {{
-    background: {BG_INPUT};
-    height: 4px;
-    border-radius: 2px;
-}}
-QSlider::handle:horizontal {{
-    background: {ACCENT};
-    width: 13px;
-    height: 13px;
-    border-radius: 6px;
-    margin: -5px 0;
-}}
-QSlider::handle:horizontal:hover {{
-    background: #79c0ff;
-}}
-QSlider::sub-page:horizontal {{
-    background: #1c3a5c;
-    border-radius: 2px;
-}}
-QPushButton#start-btn {{
-    background: #238636;
-    color: #ffffff;
-    font-weight: bold;
-    font-size: 12px;
-    border-radius: 6px;
-    padding: 9px 30px;
-    border: none;
-    min-width: 140px;
-}}
-QPushButton#start-btn:hover {{ background: #2ea043; }}
-QPushButton#start-btn:disabled {{ background: #1a4020; color: #4a7a50; }}
-QPushButton#stop-btn {{
-    background: #da3633;
-    color: #ffffff;
-    font-weight: bold;
-    font-size: 12px;
-    border-radius: 6px;
-    padding: 9px 30px;
-    border: none;
-    min-width: 140px;
-}}
-QPushButton#stop-btn:hover {{ background: #f85149; }}
-QPushButton#stop-btn:disabled {{ background: #4a1515; color: #7a3030; }}
-QComboBox {{
-    background-color: {BG_INPUT};
-    color: {TEXT_ON};
-    border: 1px solid {BORDER};
-    border-radius: 5px;
-    font-size: 10px;
-    padding: 4px 8px;
-}}
-QComboBox::drop-down {{ border: none; }}
-QComboBox QAbstractItemView {{
-    background-color: {BG_PANEL};
-    color: {TEXT_ON};
-    selection-background-color: {BG_INPUT};
-    border: 1px solid {BORDER};
-}}
-QFrame#separator {{
-    color: {BORDER};
-    background-color: {BORDER};
-    max-height: 1px;
-}}
-"""
-
-
-# ═══════════════════════════════════════════════════════════════
-#  Estado compartido (hilo audio ↔ hilo GUI)
-# ═══════════════════════════════════════════════════════════════
-class SharedState:
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOTOR DEMO  (sin hardware)
+# ═══════════════════════════════════════════════════════════════════════════════
+class DummyEngine:
     def __init__(self):
-        self.lock           = threading.Lock()
-        self.gain           = 0.30
-        self.distort_on     = False
-        self.distort_gain   = 2.0
-        self.distort_thresh = 0.7
-        self.delay_on       = False
-        self.delay_feedback = 0.4
-        self.lowpass_on     = False
-        self.lowpass_alpha  = 0.5
-        self.wave_buf       = np.zeros(DISP_LEN, dtype=np.float32)
-        self.wave_pos       = 0
-        self.rms            = 0.0
-
-        # ── NUEVAS VARIABLES PARA V0.4 ─────────────────────────
-        self.reverb_on      = False
-        self.reverb_size    = 0.60
-        self.reverb_damping = 0.45
-        self.reverb_wet     = 0.35
-        
-        self.eq_on          = False
-        self.eq_low         = 1.0
-        self.eq_mid         = 1.0
-        self.eq_high        = 1.0
-        
-        self.comp_on        = False
-        self.comp_thresh    = -20.0
-        self.comp_ratio     = 4.0
-
-
-# ═══════════════════════════════════════════════════════════════
-#  Motor de audio (sounddevice callback)
-# ═══════════════════════════════════════════════════════════════
-class AudioEngine:
-    def __init__(self, state: SharedState, in_idx: int, out_idx: int):
-        self.state     = state
-        self.in_idx    = in_idx
-        self.out_idx   = out_idx
-        self.stream    = None
-        self.delay_buf = np.zeros(CHUNK, dtype=np.float32)
-
-        self.reverb_buf = np.zeros(RATE, dtype=np.float32) # Un segundo completo de memoria
+        self.master_gain = 0.30
+        self.comp_on  = False; self.c_thr = -20.0; self.c_rat = 4.0
+        self.eq_on    = False; self.eq_l  = 1.0;   self.eq_m  = 1.0; self.eq_h = 1.0
+        self.gain     = 1.0
+        self.dist_on  = False; self.dgain = 2.0;   self.dthresh = 0.5
+        self.delay_on = False; self.dfb   = 0.5
+        self.delay_buf = np.zeros(44100)
+        self.lp_on    = False; self.alpha = 0.5
+        self._running = False
+        self.gui_queue = queue.Queue(maxsize=4)
 
     def start(self):
-        try:
-            import sounddevice as sd
-            
-            # Dejamos la configuración básica de latencia por defecto
-            sd.default.latency = ('low', 'low')
+        self._running = True
+        threading.Thread(target=self._generate, daemon=True).start()
+        return True, None
 
-            # Inicializamos el stream directo y nativo
-            self.stream = sd.Stream(
-                samplerate=RATE,
-                blocksize=CHUNK,      # Recuerda que CHUNK debe estar definido arriba (ej. 256)
-                dtype='float32',
-                channels=(1, 2),      # 1 Entrada (Guitarra Mono), 2 Salidas (Audífonos Estéreo)
-                device=(self.in_idx, self.out_idx),
-                callback=self._callback,
-                latency='low'
-            )
-            self.stream.start()
-            return True, None
-            
-        except Exception as e:
-            return False, str(e)
+    def _generate(self):
+        t = 0.0
+        while self._running:
+            n = 512
+            x = np.linspace(t, t + 0.012, n)
+            raw = (0.45 * np.sin(2 * np.pi * 82 * x)
+                 + 0.20 * np.sin(2 * np.pi * 246 * x)
+                 + 0.10 * np.sin(2 * np.pi * 440 * x)
+                 + 0.04 * np.random.randn(n))
+            raw = np.clip(raw, -1.0, 1.0).astype(np.float32)
+
+            proc = raw.copy() * self.master_gain * self.gain
+            if self.dist_on:
+                proc = np.clip(proc * self.dgain, -self.dthresh, self.dthresh)
+            if self.lp_on:
+                proc = np.convolve(proc, np.ones(5) / 5, mode="same")
+            proc = np.clip(proc, -1.0, 1.0).astype(np.float32)
+
+            try:
+                self.gui_queue.put_nowait((raw, proc))
+            except queue.Full:
+                pass
+            t += 0.012
+            time.sleep(0.033)
 
     def stop(self):
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-
-    def _callback(self, indata, outdata, frames, time, status):
-        s       = self.state
-        samples = indata[:, 0].copy()
-
-        with s.lock:
-            gain     = s.gain
-            dist_on  = s.distort_on
-            dgain    = s.distort_gain
-            dthresh  = s.distort_thresh
-            delay_on = s.delay_on
-            dfb      = s.delay_feedback
-            lp_on    = s.lowpass_on
-            alpha    = s.lowpass_alpha
-
-            # Nuevas variables leídas de forma segura desde el hilo de audio:
-            rev_on   = s.reverb_on
-            r_size   = s.reverb_size
-            r_damp   = s.reverb_damping
-            r_wet    = s.reverb_wet
-            eq_on    = s.eq_on
-            eq_l     = s.eq_low
-            eq_m     = s.eq_mid
-            eq_h     = s.eq_high
-            comp_on  = s.comp_on
-            c_thr    = s.comp_thresh
-            c_rat    = s.comp_ratio
-
-        # 2. Copia inicial de la señal limpia
-        proc = samples.copy()
-
-        # ── CADENA DSP EN CASCADA (AUDIO COMPLETO v0.4) ───────────
-        
-        # A. Compresor (Primero en la cadena para estabilizar la guitarra)
-        if comp_on:
-            proc = apply_compressor(proc, c_thr, c_rat)
-            
-        # B. Ecualizador (Modifica el tono básico)
-        if eq_on:
-            proc = apply_eq(proc, eq_l, eq_m, eq_h)
-
-        # C. Ganancia Maestra + Distorsión original
-        proc = proc * gain
-        if dist_on:
-            proc = apply_distort(proc, dgain, dthresh)
-
-        # D. Delay original
-        if delay_on:
-            proc = apply_delay(proc, self.delay_buf, dfb)
-            self.delay_buf = proc.copy()
-
-        # E. Filtro pasa-bajos original
-        if lp_on:
-            filt = np.empty_like(proc)
-            prev = proc[0]
-            for i in range(len(proc)):
-                prev    = alpha * proc[i] + (1.0 - alpha) * prev
-                filt[i] = prev
-            proc = filt
-            
-        # F. Reverb (Efecto espacial, va al final antes de la salida)
-        if rev_on:
-            proc = apply_reverb(proc, self.reverb_buf, r_size, r_damp, r_wet)
-
-        PRE_AMP = 3.5
-        proc = proc * PRE_AMP * gain
+        self._running = False
 
 
-        # Actualizar buffer circular de visualización gráfica (Líneas originales)
-        n   = len(proc)
-        end = s.wave_pos + n
-        if end <= DISP_LEN:
-            s.wave_buf[s.wave_pos:end] = proc
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDGET: SLIDER NEÓN
+# ═══════════════════════════════════════════════════════════════════════════════
+class NeonSlider(tk.Canvas):
+    def __init__(self, parent, from_=0.0, to=1.0, value=0.5,
+                 width=180, height=20, command=None, **kw):
+        super().__init__(parent, width=width, height=height,
+                         bg=C["panel2"], highlightthickness=0, **kw)
+        self.from_ = from_; self.to = to
+        self._value = value; self.command = command
+        self.W = width;      self.H = height
+        self.bind("<ButtonPress-1>",   self._click)
+        self.bind("<B1-Motion>",       self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def _norm(self):
+        return (self._value - self.from_) / (self.to - self.from_)
+
+    def _rrect(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1+r,y1, x2-r,y1, x2,y1, x2,y1+r,
+               x2,y2-r, x2,y2, x2-r,y2, x1+r,y2,
+               x1,y2, x1,y2-r, x1,y1+r, x1,y1]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _draw(self):
+        self.delete("all")
+        pad = 8; cy = self.H // 2
+        self._rrect(pad, cy-3, self.W-pad, cy+3, 3, fill=C["slider_trough"], outline="")
+        filled = pad + self._norm() * (self.W - 2*pad)
+        if filled > pad:
+            self._rrect(pad, cy-3, filled, cy+3, 3, fill=C["accent"], outline="")
+        tx = pad + self._norm() * (self.W - 2*pad); r = 7
+        self.create_oval(tx-r, cy-r, tx+r, cy+r, fill=C["panel"], outline=C["accent"], width=2)
+        self.create_oval(tx-3, cy-3, tx+3, cy+3, fill=C["accent"], outline="")
+
+    def _pos_val(self, x):
+        pad = 8
+        return self.from_ + max(0.0, min(1.0, (x-pad)/(self.W-2*pad))) * (self.to-self.from_)
+
+    def _click(self, e):
+        self._value = self._pos_val(e.x); self._draw()
+        if self.command: self.command(self._value)
+    def _drag(self, e):
+        self._value = self._pos_val(e.x); self._draw()
+        if self.command: self.command(self._value)
+    def _release(self, e): pass
+    def get(self): return self._value
+    def set(self, v):
+        self._value = max(self.from_, min(self.to, v)); self._draw()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDGET: BOTÓN TOGGLE
+# ═══════════════════════════════════════════════════════════════════════════════
+class ToggleBtn(tk.Canvas):
+    def __init__(self, parent, command=None, **kw):
+        super().__init__(parent, width=72, height=22,
+                         bg=C["panel2"], highlightthickness=0, **kw)
+        self.state = False; self.command = command
+        self.bind("<ButtonPress-1>", self._toggle); self._draw()
+
+    def _rrect(self, x1, y1, x2, y2, r, **kw):
+        pts = [x1+r,y1, x2-r,y1, x2,y1, x2,y1+r,
+               x2,y2-r, x2,y2, x2-r,y2, x1+r,y2,
+               x1,y2, x1,y2-r, x1,y1+r, x1,y1]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _draw(self):
+        self.delete("all")
+        bg = C["btn_on"] if self.state else C["btn_off"]
+        fg = C["btn_on_fg"] if self.state else C["btn_off_fg"]
+        self._rrect(1, 1, 71, 21, 5, fill=bg, outline=C["border_light"])
+        label = "● ON" if self.state else "○ OFF"
+        self.create_text(36, 11, text=label, fill=fg, font=("Consolas", 8, "bold"))
+
+    def _toggle(self, e=None):
+        self.state = not self.state; self._draw()
+        if self.command: self.command(self.state)
+
+    def set(self, v): self.state = bool(v); self._draw()
+    def get(self): return self.state
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDGET: VU METER
+# ═══════════════════════════════════════════════════════════════════════════════
+class VUMeter(tk.Canvas):
+    def __init__(self, parent, width=400, height=14, **kw):
+        super().__init__(parent, width=width, height=height,
+                         bg=C["panel2"], highlightthickness=0, **kw)
+        self.W = width; self.H = height
+        self._level = 0.0; self._peak = 0.0; self._hold = 0
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        pad = 2; w = self.W - pad*2; segs = 40; sw = w / segs
+        for i in range(segs):
+            norm = i / segs; filled = norm < self._level
+            if norm < 0.6:   col = C["vu_green"]  if filled else "#0d2018"
+            elif norm < 0.8: col = C["vu_yellow"] if filled else "#1a1200"
+            else:             col = C["vu_red"]    if filled else "#1a0008"
+            self.create_rectangle(pad + i*sw + 1, pad,
+                                  pad + (i+1)*sw - 1, self.H-pad,
+                                  fill=col, outline="")
+        if self._peak > 0:
+            px = pad + self._peak * w
+            self.create_rectangle(px-1, pad, px+1, self.H-pad, fill="white", outline="")
+
+    def set_level(self, level):
+        self._level = max(0.0, min(1.0, level))
+        if self._level > self._peak:
+            self._peak = self._level; self._hold = 50
         else:
-            first = DISP_LEN - s.wave_pos
-            s.wave_buf[s.wave_pos:] = proc[:first]
-            s.wave_buf[:end - DISP_LEN] = proc[first:]
-        s.wave_pos = end % DISP_LEN
-
-        s.rms = float(np.sqrt(np.mean(proc ** 2)))
-
-        # 4. Enviar señal limpia a ambos audífonos (Salida estéreo)
-        outdata[:, 0] = proc
+            if self._hold > 0: self._hold -= 1
+            else: self._peak = max(0.0, self._peak - 0.008)
+        self._draw()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDGET: FORMA DE ONDA
+# ═══════════════════════════════════════════════════════════════════════════════
+class Waveform(tk.Canvas):
+    def __init__(self, parent, label="", color=C["wave_in"],
+                 width=500, height=80, **kw):
+        super().__init__(parent, width=width, height=height,
+                         bg=C["panel"], highlightthickness=0, **kw)
+        self.W = width; self.H = height
+        self.label = label; self.color = color
+        self._data = np.zeros(width)
+        self._draw()
 
-# ═══════════════════════════════════════════════════════════════
-#  Widgets con QPainter (equivalente a Cairo en GTK)
-# ═══════════════════════════════════════════════════════════════
-class WaveformWidget(QWidget):
-    """Visualizador de forma de onda dibujado con QPainter."""
+    def _draw(self):
+        self.delete("all")
+        cy = self.H // 2
+        # Líneas de referencia
+        self.create_line(0, cy, self.W, cy, fill=C["border"], width=1)
+        for yo in [self.H//4, -self.H//4]:
+            self.create_line(0, cy+yo, self.W, cy+yo,
+                             fill=C["border"], width=1, dash=(2, 6))
+        # Forma de onda
+        if len(self._data) > 1:
+            pts = []
+            for x in range(self.W):
+                idx = min(int(x * len(self._data) / self.W), len(self._data)-1)
+                y = cy - self._data[idx] * (cy - 4)
+                pts.extend([x, y])
+            if len(pts) >= 4:
+                fill_pts = [0, cy] + pts + [self.W, cy]
+                # stipple en lugar de alpha hex (Tkinter no soporta #RRGGBBAA)
+                self.create_polygon(fill_pts, fill=self.color,
+                                    outline="", stipple="gray25")
+                self.create_line(pts, fill=self.color, width=1.5, smooth=False)
+        # Etiqueta
+        self.create_text(8, 8, text=self.label, anchor="nw",
+                         fill=self.color, font=("Consolas", 8))
 
-    def __init__(self, state: SharedState):
-        super().__init__()
-        self.state = state
-        self.setMinimumHeight(180)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        mid  = h / 2
-        amp  = h / 2 - 8
-
-        # Fondo
-        painter.fillRect(0, 0, w, h, QColor(BG_DARK))
-
-        # Líneas de cuadrícula
-        grid_pen = QPen(QColor(BORDER))
-        grid_pen.setWidthF(0.5)
-        painter.setPen(grid_pen)
-        for level in (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75):
-            y = int(mid - level * amp)
-            painter.drawLine(0, y, w, y)
-
-        # Línea cero
-        zero_pen = QPen(QColor(TEXT_DIM))
-        zero_pen.setWidthF(0.8)
-        painter.setPen(zero_pen)
-        painter.drawLine(0, int(mid), w, int(mid))
-
-        # Etiquetas dB
-        painter.setPen(QColor(TEXT_DIM))
-        painter.setFont(QFont('monospace', 7))
-        for level, text in ((0.75, '0 dB'), (0.0, '-∞ dB'), (-0.75, '0 dB')):
-            y = int(mid - level * amp)
-            painter.drawText(4, y + 3, text)
-
-        # Tomar snapshot del buffer (thread-safe)
-        with self.state.lock:
-            buf = np.roll(self.state.wave_buf.copy(), -self.state.wave_pos)
-
-        if len(buf) == 0:
-            return
-
-        step = max(1, len(buf) // w)
-        pts  = buf[::step][:w]
-        n    = len(pts)
-
-        # Línea de la onda
-        wave_pen = QPen(QColor(ACCENT))
-        wave_pen.setWidthF(1.0)
-        painter.setPen(wave_pen)
-
-        poly = QPolygonF()
-        for i in range(n):
-            poly.append(QPointF(i * w / n, mid - float(pts[i]) * amp))
-        painter.drawPolyline(poly)
-
-        # Área rellena bajo la curva
-        fill_color = QColor(ACCENT)
-        fill_color.setAlpha(20)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(fill_color)
-
-        fill_poly = QPolygonF()
-        fill_poly.append(QPointF(0.0, mid))
-        for i in range(n):
-            fill_poly.append(QPointF(i * w / n, mid - float(pts[i]) * amp))
-        fill_poly.append(QPointF(float(w), mid))
-        painter.drawPolygon(fill_poly)
+    def update_data(self, data):
+        if len(data) > 0:
+            idx = np.linspace(0, len(data)-1, self.W).astype(int)
+            self._data = np.clip(data[idx], -1.0, 1.0)
+        self._draw()
 
 
-class VUMeterWidget(QWidget):
-    """Barra VU con gradiente verde→amarillo→rojo."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════════
+class DAW_GUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("DAW — Estación de Trabajo de Audio Digital  ·  v2.1")
+        self.root.configure(bg=C["bg"])
+        self.root.resizable(False, False)
 
-    def __init__(self, state: SharedState):
-        super().__init__()
-        self.state = state
-        self.setFixedHeight(14)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.engine = AudioEngine() if ENGINE_AVAILABLE else DummyEngine()
+        # Aseguramos que el engine siempre tenga una cola GUI
+        if not hasattr(self.engine, "gui_queue"):
+            self.engine.gui_queue = queue.Queue(maxsize=4)
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        w, h = self.width(), self.height()
+        self._running = False
 
-        painter.fillRect(0, 0, w, h, QColor(BG_INPUT))
-
-        fill  = min(1.0, self.state.rms * 3.0)
-        bar_w = int(fill * w)
-
-        color = QColor(GREEN if fill < 0.6 else YELLOW if fill < 0.85 else RED)
-        painter.fillRect(0, 0, bar_w, h, color)
-
-        border_pen = QPen(QColor(BORDER))
-        border_pen.setWidthF(0.5)
-        painter.setPen(border_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(0, 0, w - 1, h - 1)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  Ventana principal
-# ═══════════════════════════════════════════════════════════════
-class DAWWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("DAW — Audio Digital")
-        self.resize(1050, 680)
-
-        self.state   = SharedState()
-        self.engine  = None
-        self.running = False
+        # Buffers circulares para las formas de onda (750 muestras = ancho del canvas)
+        self._buf_in  = np.zeros(750)
+        self._buf_out = np.zeros(750)
 
         self._build_ui()
+        self._update_loop()
 
-        # Actualizar waveform + VU meter a 25 fps
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(40)
-
-    # ── Construcción de la UI ──────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
+        # HEADER
+        hdr = tk.Frame(self.root, bg=C["panel"], height=46)
+        hdr.pack(fill="x", side="top"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="◉  DAW", bg=C["panel"], fg=C["accent"],
+                 font=("Consolas", 16, "bold")).pack(side="left", padx=14)
+        tk.Label(hdr, text="Estación de Trabajo de Audio Digital  ·  v2.1",
+                 bg=C["panel"], fg=C["text_dim"],
+                 font=("Consolas", 9)).pack(side="left", padx=4)
+        self.status_dot = tk.Label(hdr, text="● OFFLINE", bg=C["panel"],
+                                   fg=C["text_dim"], font=("Consolas", 9, "bold"))
+        self.status_dot.pack(side="right", padx=16)
+        tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x")
 
-        root = QVBoxLayout(central)
-        root.setSpacing(0)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(self._build_header())
+        body = tk.Frame(self.root, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=10, pady=8)
 
-        body_w = QWidget()
-        body   = QHBoxLayout(body_w)
-        body.setContentsMargins(10, 8, 10, 8)
-        body.setSpacing(10)
-        body.addWidget(self._build_left_panel())
+        # PANEL IZQUIERDO
+        left = tk.Frame(body, bg=C["panel"], width=270,
+                        highlightbackground=C["border"], highlightthickness=1)
+        left.pack(side="left", fill="y", padx=(0, 8)); left.pack_propagate(False)
+        self._build_controls(left)
 
-        right_w = QWidget()
-        right   = QVBoxLayout(right_w)
-        right.setSpacing(8)
-        right.setContentsMargins(0, 0, 0, 0)
-        right.addWidget(self._build_waveform())
-        right.addWidget(self._build_vu_meter())
-        right.addWidget(self._build_devices())
-        right.addWidget(self._build_transport())
+        # PANEL DERECHO
+        right = tk.Frame(body, bg=C["bg"])
+        right.pack(side="left", fill="both", expand=True)
+        self._build_waveform(right)
+        self._build_vu(right)
+        self._build_devices(right)
+        self._build_transport(right)
 
-        body.addWidget(right_w, stretch=1)
-        root.addWidget(body_w, stretch=1)
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _sec(self, parent, text):
+        f = tk.Frame(parent, bg=C["panel"])
+        f.pack(fill="x", padx=8, pady=(10, 2))
+        tk.Frame(f, bg=C["accent"], width=3, height=14).pack(side="left", padx=(0,6))
+        tk.Label(f, text=text, bg=C["panel"], fg=C["text"],
+                 font=("Consolas", 8, "bold")).pack(side="left")
+        return f
 
-    # ── Cabecera ───────────────────────────────────────────────
-    def _build_header(self):
-        bar = QWidget()
-        bar.setStyleSheet(
-            f"background-color: {BG_PANEL}; border-bottom: 1px solid {BORDER};"
-        )
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 4, 16, 4)
-        layout.setSpacing(12)
+    def _slider_row(self, parent, label, attr, from_, to, init, fmt):
+        """Fila con label + NeonSlider + valor. Enlaza directo al engine."""
+        f = tk.Frame(parent, bg=C["panel2"]); f.pack(fill="x", padx=8, pady=2)
+        tk.Label(f, text=label, bg=C["panel2"], fg=C["text_mid"],
+                 font=("Consolas", 8), width=10, anchor="w").pack(side="left", padx=(6,2))
+        vv = tk.StringVar(value=fmt.format(init))
+        tk.Label(f, textvariable=vv, bg=C["panel2"], fg=C["accent"],
+                 font=("Consolas", 8), width=7, anchor="e").pack(side="right", padx=(0,6))
+        def cb(v, a=attr, s=fmt, lv=vv):
+            if a: setattr(self.engine, a, v)
+            lv.set(s.format(v))
+        NeonSlider(f, from_=from_, to=to, value=init, command=cb).pack(
+            side="left", fill="x", expand=True, padx=4)
 
-        for text, name in (("⬡", "header-title"), ("DAW", "header-title")):
-            lbl = QLabel(text)
-            lbl.setObjectName(name)
-            layout.addWidget(lbl)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _build_controls(self, parent):
+        tk.Label(parent, text="CONTROLES", bg=C["panel"], fg=C["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=12, pady=(10,4))
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=8)
 
-        sub = QLabel("Estación de Trabajo de Audio Digital · Prototipo v0.4")
-        sub.setObjectName("header-sub")
-        layout.addWidget(sub)
-        layout.addStretch()
+        # MASTER
+        self._sec(parent, "MASTER")
+        self._slider_row(parent, "Ganancia", "master_gain", 0.0, 1.0, 0.30, "{:.2f}")
 
-        self.status_lbl = QLabel("⏹  DETENIDO")
-        self.status_lbl.setStyleSheet(
-            f"color: {RED}; font-size: 10px; font-weight: bold;"
-        )
-        layout.addWidget(self.status_lbl)
-        return bar
+        # DISTORSIÓN
+        sf = self._sec(parent, "DISTORSIÓN")
+        ToggleBtn(sf, command=lambda v: setattr(self.engine, "dist_on", v)).pack(side="right")
+        self._slider_row(parent, "Gain",      "dgain",   1.0, 10.0, 2.0,  "{:.1f}")
+        self._slider_row(parent, "Threshold", "dthresh", 0.1,  1.0, 0.5,  "{:.2f}")
 
-    # ── Panel izquierdo (efectos) ──────────────────────────────
-    def _build_left_panel(self):
-        panel = QWidget()
-        panel.setStyleSheet(
-            f"QWidget {{ background-color: {BG_PANEL}; border: 1px solid {BORDER};"
-            f" border-radius: 8px; }}"
-        )
-        panel.setFixedWidth(280)
+        # DELAY
+        sd = self._sec(parent, "DELAY")
+        ToggleBtn(sd, command=lambda v: setattr(self.engine, "delay_on", v)).pack(side="right")
+        self._slider_row(parent, "Feedback", "dfb", 0.0, 0.95, 0.5, "{:.2f}")
 
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        # FILTRO PASA-BAJOS
+        slp = self._sec(parent, "FILTRO PASA-BAJOS")
+        ToggleBtn(slp, command=lambda v: setattr(self.engine, "lp_on", v)).pack(side="right")
+        self._slider_row(parent, "Alpha", "alpha", 0.01, 1.0, 0.5, "{:.2f}")
 
-        layout.addWidget(self._section_label("CONTROLES"))
-        layout.addWidget(self._separator())
+        # REVERB  (atributos opcionales en el engine)
+        srv = self._sec(parent, "REVERB")
+        ToggleBtn(srv).pack(side="right")  # reverb_on no está en el engine base aún
+        self._slider_row(parent, "Size",    None, 0.1, 1.0, 0.60, "{:.2f}")
+        self._slider_row(parent, "Damping", None, 0.0, 1.0, 0.45, "{:.2f}")
+        self._slider_row(parent, "Wet Mix", None, 0.0, 1.0, 0.25, "{:.2f}")
 
-        layout.addWidget(self._effect_section(
-            "MASTER", None,
-            [("Ganancia", 0.0, 6.0, 1.00, 'gain', '{:.2f}')], 
-        ))
-        layout.addWidget(self._effect_section(
-            "DISTORSIÓN", ('distort_on', f"background:#3d1a1a; color:{RED}; border-color:{RED};", "Activar"),
-            [("Gain",      1.0, 10.0, 2.0, 'distort_gain',   '{:.1f}'),
-             ("Threshold", 0.1,  1.0, 0.7, 'distort_thresh',  '{:.2f}')],
-        ))
-        layout.addWidget(self._effect_section(
-            "DELAY", ('delay_on', f"background:#1c3a5c; color:{ACCENT}; border-color:{ACCENT};", "Activar"),
-            [("Feedback", 0.0, 0.9, 0.4, 'delay_feedback', '{:.2f}')],
-        ))
-        layout.addWidget(self._effect_section(
-            "FILTRO PASA-BAJOS", ('lowpass_on', f"background:#271a3d; color:{PURPLE}; border-color:{PURPLE};", "Activar"),
-            [("Alpha", 0.05, 1.0, 0.5, 'lowpass_alpha', '{:.2f}')],
-        ))
+        # ECUALIZADOR
+        seq = self._sec(parent, "EQUALIZADOR (EQ)")
+        ToggleBtn(seq, command=lambda v: setattr(self.engine, "eq_on", v)).pack(side="right")
 
-        # ── NUEVOS PANELES V0.4 ────────────────────────────────
-        layout.addWidget(self._effect_section(
-            "REVERB", ('reverb_on', f"background:#1a3d37; color:#3fb950; border-color:#3fb950;", "Activar"),
-            [("Size",    0.1, 1.0, 0.60, 'reverb_size',    '{:.2f}'),
-             ("Damping", 0.0, 1.0, 0.45, 'reverb_damping', '{:.2f}'),
-             ("Wet Mix", 0.0, 1.0, 0.35, 'reverb_wet',     '{:.2f}')],
-        ))
+        for lbl, attr, init in [("Low", "eq_l", 1.0), ("Mid", "eq_m", 0.8), ("High", "eq_h", 1.2)]:
+            f = tk.Frame(parent, bg=C["panel2"]); f.pack(fill="x", padx=8, pady=2)
+            tk.Label(f, text=lbl, bg=C["panel2"], fg=C["text_mid"],
+                     font=("Consolas", 8), width=10, anchor="w").pack(side="left", padx=(6,2))
+            vv = tk.StringVar(value="{:+.1f}dB".format(20*np.log10(max(init,0.001))))
+            tk.Label(f, textvariable=vv, bg=C["panel2"], fg=C["accent"],
+                     font=("Consolas", 8), width=7, anchor="e").pack(side="right", padx=(0,6))
+            def _cb(v, a=attr, lv=vv):
+                setattr(self.engine, a, v)
+                lv.set("{:+.1f}dB".format(20*np.log10(max(v, 0.001))))
+            NeonSlider(f, from_=0.0, to=3.0, value=init, command=_cb).pack(
+                side="left", fill="x", expand=True, padx=4)
 
-        layout.addWidget(self._effect_section(
-            "EQUALIZADOR (EQ)", ('eq_on', f"background:#3d361a; color:{YELLOW}; border-color:{YELLOW};", "Activar"),
-            [("Low",  0.1, 2.0, 1.0, 'eq_low',  '{:.2f}'),
-             ("Mid",  0.1, 2.0, 1.0, 'eq_mid',  '{:.2f}'),
-             ("High", 0.1, 2.0, 1.0, 'eq_high', '{:.2f}')],
-        ))
+        # COMPRESOR
+        sco = self._sec(parent, "COMPRESOR")
+        ToggleBtn(sco, command=lambda v: setattr(self.engine, "comp_on", v)).pack(side="right")
+        self._slider_row(parent, "Threshold", "c_thr", -60.0,  0.0, -20.0, "{:.0f} dB")
+        self._slider_row(parent, "Ratio",     "c_rat",   1.0, 20.0,   4.0, "{:.1f}:1")
+        self._slider_row(parent, "Attack",    None,      1.0, 200.0,  15.0, "{:.0f} ms")
+        self._slider_row(parent, "Release",   None,     10.0,2000.0, 100.0, "{:.0f} ms")
 
-        layout.addWidget(self._effect_section(
-            "COMPRESOR", ('comp_on', f"background:#2a1a3d; color:#d2a8ff; border-color:#d2a8ff;", "Activar"),
-            [("Threshold", -40.0, 0.0, -20.0, 'comp_thresh', '{:.1f} dB'),
-             ("Ratio",       1.0, 8.0,   4.0, 'comp_ratio',  '{:.1f}:1')],
-        ))
+        tk.Frame(parent, bg=C["panel"]).pack(fill="both", expand=True)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    def _build_waveform(self, parent):
+        wf = tk.Frame(parent, bg=C["panel"],
+                      highlightbackground=C["border"], highlightthickness=1)
+        wf.pack(fill="x", pady=(0, 6))
+        tk.Label(wf, text="FORMA DE ONDA", bg=C["panel"], fg=C["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=12, pady=(8,4))
+        tk.Frame(wf, bg=C["border"], height=1).pack(fill="x", padx=8)
 
-        layout.addStretch()
-        return panel
+        inner = tk.Frame(wf, bg=C["panel"]); inner.pack(fill="x", padx=8, pady=6)
+        for label, color, attr in [
+            ("Entrada Directa",  C["wave_in"],  "_wave_in"),
+            ("Salida Procesada", C["wave_out"], "_wave_out"),
+        ]:
+            row = tk.Frame(inner, bg=C["panel"]); row.pack(fill="x", pady=3)
+            lc = tk.Frame(row, bg=C["panel"], width=38); lc.pack(side="left"); lc.pack_propagate(False)
+            for db in ["0 dB", "", "-0 dB"]:
+                tk.Label(lc, text=db, bg=C["panel"], fg=C["text_dim"],
+                         font=("Consolas", 7)).pack(anchor="e")
+            w = Waveform(row, label=label, color=color, width=750, height=72)
+            w.pack(side="left", padx=(4, 0))
+            setattr(self, attr, w)
 
-    def _effect_section(self, title, toggle, rows):
-        box    = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setSpacing(6)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def _build_vu(self, parent):
+        vuf = tk.Frame(parent, bg=C["panel2"],
+                       highlightbackground=C["border"], highlightthickness=1)
+        vuf.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(vuf, bg=C["panel2"]); inner.pack(fill="x", padx=10, pady=6)
+        self._vu_meters = []
+        for lbl, tag in [("VU", "in_l"), ("VR", "in_r"), ("VU", "out")]:
+            row = tk.Frame(inner, bg=C["panel2"]); row.pack(fill="x", pady=2)
+            tk.Label(row, text=lbl, bg=C["panel2"], fg=C["text_dim"],
+                     font=("Consolas", 8), width=3).pack(side="left")
+            m = VUMeter(row, width=680, height=14); m.pack(side="left", padx=4)
+            vv = tk.StringVar(value="0.000")
+            tk.Label(row, textvariable=vv, bg=C["panel2"], fg=C["text_mid"],
+                     font=("Consolas", 8), width=6).pack(side="left")
+            self._vu_meters.append((m, vv))
 
-        # Fila título + botón toggle
-        header_row = QHBoxLayout()
-        header_row.addWidget(self._section_label(title))
-        header_row.addStretch()
+    def _build_devices(self, parent):
+        df = tk.Frame(parent, bg=C["panel"],
+                      highlightbackground=C["border"], highlightthickness=1)
+        df.pack(fill="x", pady=(0, 6))
+        tk.Label(df, text="DISPOSITIVOS DE AUDIO", bg=C["panel"], fg=C["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=12, pady=(8,4))
+        tk.Frame(df, bg=C["border"], height=1).pack(fill="x", padx=8)
+        row = tk.Frame(df, bg=C["panel"]); row.pack(fill="x", padx=10, pady=6)
+        for side, lbl, default in [
+            ("left",  "Entrada:", "1: Focusrite Scarlett Solo (3rd Gen)"),
+            ("right", "Salida:",  "8: Realtek Speakers (High Def Audio)"),
+        ]:
+            col = tk.Frame(row, bg=C["panel"]); col.pack(side=side, fill="x", expand=True, padx=4)
+            tk.Label(col, text=lbl, bg=C["panel"], fg=C["text_dim"],
+                     font=("Consolas", 8)).pack(anchor="w")
+            e = tk.Entry(col, bg=C["panel2"], fg=C["text"], insertbackground=C["accent"],
+                         font=("Consolas", 9), relief="flat",
+                         highlightbackground=C["border"], highlightthickness=1)
+            e.insert(0, default); e.pack(fill="x", ipady=4, pady=(2,0))
 
-        if toggle:
-            key, checked_style, btn_lbl = toggle
-            btn = QPushButton(btn_lbl)
-            btn.setCheckable(True)
-            base_style = (
-                f"QPushButton {{ background-color: {BG_INPUT}; color: {TEXT_DIM};"
-                f" border-radius: 5px; border: 1px solid {BORDER};"
-                f" padding: 4px 12px; font-size: 10px; font-weight: bold; }}"
-                f"QPushButton:checked {{ {checked_style} }}"
-            )
-            btn.setStyleSheet(base_style)
-            btn.toggled.connect(lambda checked, k=key: self._set_state(k, checked))
-            header_row.addWidget(btn)
+    def _build_transport(self, parent):
+        tp = tk.Frame(parent, bg=C["bg"]); tp.pack(fill="x", pady=4)
+        self._btn_start = tk.Button(
+            tp, text="▶  INICIAR DSP", bg=C["accent"], fg=C["bg"],
+            font=("Consolas", 11, "bold"), relief="flat", cursor="hand2",
+            padx=28, pady=8, activebackground="#00c080", command=self._start_dsp)
+        self._btn_start.pack(side="left", padx=6)
+        self._btn_stop = tk.Button(
+            tp, text="■  DETENER", bg=C["danger"], fg="white",
+            font=("Consolas", 11, "bold"), relief="flat", cursor="hand2",
+            padx=28, pady=8, activebackground="#cc0033", state="disabled",
+            command=self._stop_dsp)
+        self._btn_stop.pack(side="left", padx=6)
+        self._status_lbl = tk.Label(tp, text="● Motor detenido",
+                                    bg=C["bg"], fg=C["text_dim"], font=("Consolas", 9))
+        self._status_lbl.pack(side="left", padx=12)
 
-        layout.addLayout(header_row)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _start_dsp(self):
+        self._status_lbl.config(text="⟳ Iniciando motor...", fg=C["warn"])
+        self.root.update()
 
-        # Sliders de parámetros
-        for (lbl_text, lo, hi, init, key, fmt) in rows:
-            row = QHBoxLayout()
-            row.setContentsMargins(4, 0, 0, 0)
-            row.setSpacing(4)
+        # Parchear _callback del engine real para alimentar la gui_queue
+        if ENGINE_AVAILABLE and isinstance(self.engine, AudioEngine):
+            _orig = self.engine._callback
+            _q    = self.engine.gui_queue
+            def _patched(indata, outdata, frames, time_info, status):
+                _orig(indata, outdata, frames, time_info, status)
+                try:
+                    _q.put_nowait((indata[:, 1].copy(), outdata[:, 0].copy()))
+                except queue.Full:
+                    pass
+            self.engine._callback = _patched
 
-            lbl_w = QLabel(lbl_text)
-            lbl_w.setObjectName('param-lbl')
-            lbl_w.setFixedWidth(80)
-            row.addWidget(lbl_w)
-
-            sl = QSlider(Qt.Orientation.Horizontal)
-            sl.setRange(0, 1000)
-            sl.setValue(int((init - lo) / (hi - lo) * 1000))
-            row.addWidget(sl, stretch=1)
-
-            val_lbl = QLabel(fmt.format(init))
-            val_lbl.setObjectName('value-lbl')
-            val_lbl.setFixedWidth(38)
-            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            row.addWidget(val_lbl)
-
-            def on_change(v, lo=lo, hi=hi, k=key, vl=val_lbl, f=fmt):
-                real_v = lo + (v / 1000.0) * (hi - lo)
-                vl.setText(f.format(real_v))
-                self._set_state(k, real_v)
-
-            sl.valueChanged.connect(on_change)
-            layout.addLayout(row)
-
-        return box
-
-    def _set_state(self, key, value):
-        with self.state.lock:
-            setattr(self.state, key, value)
-
-    # ── Visualizador de forma de onda ──────────────────────────
-    def _build_waveform(self):
-        frame  = QWidget()
-        frame.setStyleSheet(
-            f"background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 8px;"
-        )
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(0, 6, 0, 0)
-        layout.setSpacing(4)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(10, 0, 10, 0)
-        header.addWidget(self._section_label("FORMA DE ONDA"))
-        layout.addLayout(header)
-
-        self.wave_widget = WaveformWidget(self.state)
-        layout.addWidget(self.wave_widget)
-        return frame
-
-    # ── VU meter ───────────────────────────────────────────────
-    def _build_vu_meter(self):
-        frame  = QWidget()
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.setSpacing(10)
-
-        layout.addWidget(self._section_label("VU"))
-
-        self.vu_widget = VUMeterWidget(self.state)
-        layout.addWidget(self.vu_widget, stretch=1)
-
-        self.vu_lbl = QLabel("0.000")
-        self.vu_lbl.setObjectName('value-lbl')
-        self.vu_lbl.setFixedWidth(46)
-        self.vu_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(self.vu_lbl)
-        return frame
-
-    # ── Selección de dispositivos ──────────────────────────────
-    def _build_devices(self):
-        frame  = QWidget()
-        frame.setStyleSheet(
-            f"background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 8px;"
-        )
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(0, 6, 0, 8)
-        layout.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(10, 0, 10, 0)
-        header.addWidget(self._section_label("DISPOSITIVOS DE AUDIO"))
-        layout.addLayout(header)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(10, 0, 10, 0)
-        row.setSpacing(16)
-
-        inputs, outputs = self._get_devices()
-
-        for label_text, devices, attr in (
-            ("Entrada:", inputs, 'in_combo'),
-            ("Salida:",  outputs, 'out_combo'),
-        ):
-            col   = QVBoxLayout()
-            lbl   = QLabel(label_text)
-            lbl.setObjectName('dim-lbl')
-            col.addWidget(lbl)
-            combo = QComboBox()
-            for idx, name in devices:
-                combo.addItem(f"{idx}: {name[:42]}", idx)
-            setattr(self, attr, combo)
-            col.addWidget(combo)
-            row.addLayout(col)
-
-        layout.addLayout(row)
-        return frame
-
-    def _get_devices(self):
-        inputs, outputs = [], []
-        for i, d in enumerate(sd.query_devices()):
-            if d['max_input_channels'] > 0:
-                inputs.append((i, d['name']))
-            if d['max_output_channels'] > 0:
-                outputs.append((i, d['name']))
-        return inputs, outputs
-
-    # ── Controles de transporte ────────────────────────────────
-    def _build_transport(self):
-        bar    = QWidget()
-        layout = QHBoxLayout(bar)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(12)
-
-        self.play_btn = QPushButton("▶  INICIAR DSP")
-        self.play_btn.setObjectName('start-btn')
-        self.play_btn.clicked.connect(self._on_play)
-        layout.addWidget(self.play_btn)
-
-        self.stop_btn = QPushButton("■  DETENER")
-        self.stop_btn.setObjectName('stop-btn')
-        self.stop_btn.clicked.connect(self._on_stop)
-        self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
-
-        return bar
-
-    def _on_play(self):
-        in_id  = self.in_combo.currentData()
-        out_id = self.out_combo.currentData()
-        if in_id is None or out_id is None:
-            QMessageBox.critical(self, "Error de Audio",
-                                 "Selecciona dispositivos de entrada y salida.")
-            return
-
-        self.engine = AudioEngine(self.state, int(in_id), int(out_id))
         ok, err = self.engine.start()
-        if not ok:
-            QMessageBox.critical(self, "Error de Audio",
-                                 f"Error al abrir audio:\n{err}")
-            self.engine = None
-            return
+        if ok:
+            self._running = True
+            self._btn_start.config(state="disabled")
+            self._btn_stop.config(state="normal")
+            self._status_lbl.config(text="● Motor DSP activo", fg=C["accent"])
+            self.status_dot.config(text="● EN LÍNEA", fg=C["accent"])
+        else:
+            self._status_lbl.config(
+                text=f"✗ Error: {(err or 'desconocido')[:60]}", fg=C["danger"])
 
-        self.running = True
-        self.play_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.in_combo.setEnabled(False)
-        self.out_combo.setEnabled(False)
-        self.status_lbl.setText("▶  ACTIVO")
-        self.status_lbl.setStyleSheet(
-            f"color: {GREEN}; font-size: 10px; font-weight: bold;"
-        )
+    def _stop_dsp(self):
+        self._running = False
+        self.engine.stop()
+        self._btn_start.config(state="normal")
+        self._btn_stop.config(state="disabled")
+        self._status_lbl.config(text="● Motor detenido", fg=C["text_dim"])
+        self.status_dot.config(text="● OFFLINE", fg=C["text_dim"])
 
-    def _on_stop(self):
-        if self.engine:
-            self.engine.stop()
-            self.engine = None
-        self.running    = False
-        self.state.rms  = 0.0
-        self.play_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.in_combo.setEnabled(True)
-        self.out_combo.setEnabled(True)
-        self.status_lbl.setText("⏹  DETENIDO")
-        self.status_lbl.setStyleSheet(
-            f"color: {RED}; font-size: 10px; font-weight: bold;"
-        )
+    # ──────────────────────────────────────────────────────────────────────────
+    def _update_loop(self):
+        """Consume la gui_queue y actualiza ondas + VU meters."""
+        raw_d = proc_d = None
+        q = getattr(self.engine, "gui_queue", None)
+        if q:
+            while True:         # vaciamos; nos quedamos con el frame más reciente
+                try:
+                    raw_d, proc_d = q.get_nowait()
+                except queue.Empty:
+                    break
 
-    def _tick(self):
-        """Refresco de UI a 25 fps (equivale a GLib.timeout_add)."""
-        self.wave_widget.update()
-        self.vu_widget.update()
-        self.vu_lbl.setText(f"{self.state.rms:.3f}")
+        if raw_d is not None and len(raw_d) > 0:
+            n = len(raw_d)
+            # Buffer circular → scroll continuo de la onda
+            self._buf_in  = np.roll(self._buf_in,  -n); self._buf_in[-n:]  = raw_d
+            self._buf_out = np.roll(self._buf_out, -n); self._buf_out[-n:] = proc_d
+            self._wave_in.update_data(self._buf_in)
+            self._wave_out.update_data(self._buf_out)
 
-    def closeEvent(self, event):
-        if self.engine:
-            self.engine.stop()
-        event.accept()
+            lvl_in  = min(1.0, float(np.sqrt(np.mean(raw_d**2)))  * 3.0)
+            lvl_out = min(1.0, float(np.sqrt(np.mean(proc_d**2))) * 3.0)
+        else:
+            lvl_in = lvl_out = 0.0
 
-    # ── Helpers UI ─────────────────────────────────────────────
-    def _section_label(self, text):
-        lbl = QLabel(text)
-        lbl.setObjectName('section-lbl')
-        return lbl
+        for i, (meter, vv) in enumerate(self._vu_meters):
+            lvl = lvl_in if i < 2 else lvl_out
+            meter.set_level(lvl)
+            vv.set(f"{lvl:.3f}")
 
-    def _separator(self):
-        sep = QFrame()
-        sep.setObjectName('separator')
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        return sep
+        self.root.after(33, self._update_loop)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Aplicación
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet(QSS)
-    win = DAWWindow()
-    win.show()
-    sys.exit(app.exec())
+    root = tk.Tk()
+    root.geometry("1100x720")
+    icon = os.path.join(os.path.dirname(__file__), "assets", "icon.ico")
+    if os.path.exists(icon):
+        try: root.iconbitmap(icon)
+        except: pass
+    DAW_GUI(root)
+    root.mainloop()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
