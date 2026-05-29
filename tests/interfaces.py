@@ -1,6 +1,10 @@
-import pyaudio
-p = pyaudio.PyAudio()
-for i in range(p.get_device_count()):
-    info = p.get_device_info_by_index(i)
-    print(f"ID: {i} - Nombre: {info['name']}")
-p.terminate()
+import os
+
+# ¡ESTA LÍNEA ES LA CLAVE! 
+# Le dice a sounddevice que cargue el binario compatible con ASIO
+os.environ["SD_ENABLE_ASIO"] = "1"
+
+import sounddevice as sd
+
+# Ahora imprimimos para ver si ocurrió el milagro
+print(sd.query_devices())
