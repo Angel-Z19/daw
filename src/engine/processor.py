@@ -51,7 +51,7 @@ class AudioEngine:
             # 2. Tu configuración exacta que ya demostró tener CERO delay
             fs = 44100         
             blocksize = 128    # Forzamos el buffer ultra bajo de tu prueba exitosa
-            device_idx = 26    # ¡Tu índice mágico que conecta directo a Focusrite ASIO!
+            device_idx = 32    # ¡Tu índice mágico que conecta directo a Focusrite ASIO!
 
             # 3. Encendemos el stream ASIO nativo usando tus funciones internas
             self.stream = sd.Stream(

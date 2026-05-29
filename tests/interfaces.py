@@ -1,7 +1,10 @@
-import pyaudio
-p = pyaudio.PyAudio()
+import os
 
-for i in range(p.get_device_count()):
-    dev = p.get_device_info_by_index(i)
-    # Si el hostapi es el de ASIO (suele ser el índice 3 o 4 en Windows, o búscalo por nombre)
-    print(f"ID: {i} | Nombre: {dev['name']} | Canales Entrada: {dev['maxInputChannels']}")
+# ¡ESTA LÍNEA ES LA CLAVE! 
+# Le dice a sounddevice que cargue el binario compatible con ASIO
+os.environ["SD_ENABLE_ASIO"] = "1"
+
+import sounddevice as sd
+
+# Ahora imprimimos para ver si ocurrió el milagro
+print(sd.query_devices())
